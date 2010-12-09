@@ -30,9 +30,40 @@
 (require 'cl)
 
 (defvar rc-emacsen "emacs")
-
 (defconst rc-site-lisp (expand-file-name (concat "~/.emacs.d/rc/site-lisp."
                                                  rc-emacsen)))
+
+(defconst rc-ext-error-buffer nil)
+
+
+(defun rc-ext-file-with-face (file)
+  (let ((km (make-sparse-keymap))
+        (str (copy-sequence file)))
+    (define-key km (kbd "<RET>") `(lambda ()
+                                    (interactive)
+                                    (find-file ,file)))
+    (set-text-properties 0 (length str)
+                         `(keymap ,km
+                           face ((:underline t)))
+                         str)
+    str))
+
+;; (insert (rc-ext-file-with-face "~/.emacs.el"))~/.emacs.el
+
+(defmacro rc-ext-with-error-buffer (&rest form)
+  `(progn
+     (unless (buffer-live-p rc-ext-error-buffer)
+       (setq rc-ext-error-buffer
+             (get-buffer-create "*rc-ext-errors*")))
+     (save-excursion
+       (set-buffer rc-ext-error-buffer)
+       ,@form)))
+
+(defun rc-ext-error-message (form &rest vals)
+  (apply 'message form vals)
+  (rc-ext-with-error-buffer
+   (insert (apply 'format form vals) "\n")))
+
 
 (unless (file-exists-p rc-site-lisp)
   (make-directory rc-site-lisp))
@@ -151,7 +182,7 @@
          filename)))))
 
 
-(defun rc-ext-internal (path load get init retry)
+(defun rc-ext-internal (path load get init file  retry)
   (let ((rc-site-lisp
          (expand-file-name
           (if path
@@ -163,17 +194,29 @@
       (setq load-path (cons rc-site-lisp load-path)))
     (unless (file-exists-p rc-site-lisp)
       (make-directory rc-site-lisp))
-    (condition-case e
-        (progn
-          (apply load ())
-          (apply init ())
-          t)
-      (error 
-       (if retry
-           (progn
-             (apply get ())
-             (rc-ext-internal path load get init nil))
-         (message (format "%S" e))
+    (when (condition-case e
+              (progn
+                (apply load ())
+                t)
+            (error 
+             (rc-ext-error-message
+              "loading-error: %s : %S"
+              (rc-ext-file-with-face file)
+              e)
+             (if retry
+                 (progn
+                   (apply get ())
+                   (rc-ext-internal path load get init file nil))
+               nil)))
+      (condition-case e
+          (progn
+            (apply init ())
+            t)
+        (error
+         (rc-ext-error-message
+          "init-error: %s : %S"
+          (rc-ext-file-with-face file)
+          e)
          nil)))))
 
 (defvar rc-ext-classes-alist ())
@@ -181,6 +224,8 @@
 
 (defun rc-ext (&rest args)
   (let* ((name     (plist-get args :name    ))
+         (file     (or (plist-get args :file)
+                       rc-boot-current-loading-file))
          (funcs    (plist-get args :autoload))
          (class    (plist-get args :class   ))
          (rc-ext-current-class class)
@@ -202,7 +247,9 @@
                       ,(if (stringp get)
                            `(lambda () (rc-get ,get))    (or get  (lambda ())))
                       ,(or init (lambda ()))
-                      t)))
+                      ,file
+                      t
+                      )))
 
          (exec      (and
                      (apply (or (plist-get args :cond)
