@@ -220,10 +220,18 @@
                 (set-buffer error-buffer)
                  (funcall cb)))))
 
+    (defun rc-ext:log (form &rest vals)
+      (with-error-buffer
+       (lambda () (insert (apply 'format form vals) "\n"))))
+
     (defun rc-ext:error-message (form &rest vals)
       (apply 'message form vals)
       (with-error-buffer
        (lambda () (insert (apply 'format form vals) "\n"))))
+
+    (defun rc-ext:error (form &rest vals)
+      (apply 'rc-ext:error-message form vals)
+      (error (apply 'format form vals)))
 
     ))
 
@@ -256,53 +264,56 @@
 
   (defun rc-ext:run (name)
     (unless (member name provided)
-      (let* ((config  (assq name mods-alist))
-             (depends (cadr config))
-             (body    (caddr config))
-             (deplen  0))
+      (let ((config  (assq name mods-alist)))
+        (if config
+            (let ((depends (cadr config))
+                  (body    (caddr config))
+                  (deplen  0))
 
-        (dolist (dep depends)
-          (unless (member dep provided)
-            (setq deplen (1+ deplen))))
+              (dolist (dep depends)
+                (unless (member dep provided)
+                  (setq deplen (1+ deplen))))
 
-        (if (zerop deplen)
-            (rc-ext:provide name body)
+              (if (zerop deplen)
+                  (rc-ext:provide name body)
 
-          (let ((modinfo (list name body deplen)))
-            (dolist (dep depends)
-              (let ((slot (plist-get waiting-plist dep)))
-                (if slot
-                    (plist-set waiting-plist
+                (let ((modinfo (list name body deplen)))
+                  (dolist (dep depends)
+                    (let ((slot (plist-get waiting-plist dep)))
+                      (if slot
+                          (plist-set waiting-plist
                                dep
                                (cons modinfo slot))
-                  (setq waiting-plist
-                        (cons dep (cons (list modinfo)
-                                        waiting-plist)))))))))))
+                        (setq waiting-plist
+                              (cons dep (cons (list modinfo)
+                                              waiting-plist)))))))))
+          (rc-ext:error "unknown config %s" name)))))
 
   (lexical-let ((last-error nil))
     (defun rc-ext:lazy-run (name)
       (if (member name provided) t
-        (let* ((config  (assq name mods-alist))
-               (depends (cadr config))
-               (body    (caddr config))
-               (file    (cadddr config)))
-          (condition-case err
-              (progn
-                (dolist (dep depends)
-                  (unless (rc-ext:lazy-run dep) (error last-error)))
-                (rc-ext:provide name body))
-            (error (setq last-error err)
-                   (rc-ext:error-message "lazy-run: %s %s"
-                                         file
-                                         err)
-                   nil)))))))
+        (let ((config  (assq name mods-alist)))
+          (when config
+            (let ((depends (cadr config))
+                  (body    (caddr config))
+                  (file    (cadddr config)))
+              (condition-case err
+                  (progn
+                    (dolist (dep depends)
+                      (unless (rc-ext:lazy-run dep) (error last-error)))
+                    (rc-ext:provide name body))
+                (error (setq last-error err)
+                       (rc-ext:error-message "lazy-run: %s %s"
+                                             file
+                                             err)
+                       nil)))))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;
 ;;; functions for main api
 ;;;
 
-(defun rc-ext:execute-body (path load get init file  retry)
+(defun rc-ext:execute-body (name path load get init file  retry)
   (let ((rc-site-lisp
          (expand-file-name
           (if path
@@ -316,22 +327,23 @@
       (make-directory rc-site-lisp))
     (when (condition-case e
               (progn
-                (rc-ext:error-message "load: %s" (rc-ext:file-with-face file))
+                (rc-ext:log "load %s: %s" name (rc-ext:file-with-face file))
                 (apply load ())
                 t)
             (error 
              (rc-ext:error-message
-              "loading-error: %s : %S"
+              "loading-error: %s : %S %S"
               (rc-ext:file-with-face file)
-              e)
+              e
+              load)
              (if retry
                  (progn
                    (apply get ())
-                   (rc-ext:execute-body path load get init file nil))
+                   (rc-ext:execute-body name path load get init file nil))
                nil)))
       (condition-case e
           (progn
-            (rc-ext:error-message "init: %s" (rc-ext:file-with-face file))
+            (rc-ext:log "init %s: %s" name (rc-ext:file-with-face file))
             (apply init ())
             t)
         (error
@@ -350,10 +362,10 @@
 (lexical-let ((symcounter 0))
 
   (defun rc-ext (&rest args)
-    (let* ((name     (or (plist-get args     :name)
-                         (intern (format "config-%d"
-                                         (setq symcounter
-                                               (1+ symcounter))))))
+    (let* ((name     (plist-get args     :name))
+           (cfg-name (or name (intern (format "config-%d"
+                                              (setq symcounter
+                                                    (1+ symcounter))))))
 
            (requires (plist-get args :requires))
 
@@ -367,10 +379,7 @@
            (path     (plist-get args :path    ))
 
            (load     (let ((load (if (member :load args)
-                                     (plist-get args :load)
-                                   (or
-                                    name
-                                    (and (symbolp funcs) funcs)))))
+                                     (plist-get args :load) name)))
                        (if (and load (symbolp load))
                            `(lambda () (require ',load))
                          (or load (lambda ())))))
@@ -399,11 +408,11 @@
       (when exec
         (apply preload ())
         (rc-ext:defconfig
-         name
+         cfg-name
          requires
          `(lambda ()
             (let ((rc-ext-current-class ',class))
-              (rc-ext:execute-body ,path ,load ,get ,init ,file t)))
+              (rc-ext:execute-body ',cfg-name ,path ,load ,get ,init ,file t)))
          file)
 
           (if funcs
@@ -420,15 +429,16 @@
                              (interactive)
                              (dolist (alsym ',(mapcar 'car funcs))
                              (fset alsym nil))
-                             (if (rc-ext:lazy-run ',name)
+                             (if (rc-ext:lazy-run ',cfg-name)
                                  (if (called-interactively-p)
                                      (call-interactively ',sym)
                                    (apply ',sym args))
                                (rc-ext:error-message
-                                "initialize failed: %s"
+                                "initialize failed: %s %s"
+                                ',cfg-name
                                 (rc-ext:file-with-face ,file))))))))
 
-            (rc-ext:run name))))))
+            (rc-ext:run cfg-name))))))
 
   
   
