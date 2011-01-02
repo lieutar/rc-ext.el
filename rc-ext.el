@@ -168,7 +168,7 @@
                           opts))
            (not-compile (and (member :compile opts)
                              (not (plist-get :compile opts))))
-           (opt-filename    (plist-get :filename )))
+           (opt-filename    (plist-get :filename opts)))
     (with-url
      url
      `(lambda (buf res)
@@ -188,14 +188,63 @@
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;
-;;; internal variables
+;;; debugging utilities
 ;;;
+
+(defun rc-ext:debug:backtrace1 (cont debugger-args skip)
+  (format "%S\nbacktrace:%s"
+          debugger-args
+          (let ((drop  t)
+                (depth 0)
+                (trace t)
+                (skip (or skip 0))
+                (all  ""))
+            (while trace
+              (unless (eq trace t)
+                (if drop
+                    (if (eq (cadr trace) 'rc-ext:debug:backtrace)
+                        (setq drop nil))
+                  (if (> 1 skip)
+                      (setq all
+                            (concat
+                             all
+                             "\n"
+                             (format "\t%S" (cdr trace))))
+                    (setq skip (1- skip)))))
+              (setq trace (backtrace-frame depth))
+              (setq depth (1+ depth))
+              (when (and (eq    (cadr  trace) 'catch)
+                         (equal (caddr trace) (list 'quote cont)))
+                (setq trace nil)))
+            all)))
+
+(defun rc-ext:debug:backtrace (cont debugger-args &optional skip)
+  ""
+  (throw cont (rc-ext:debug:backtrace1 cont debugger-args skip)))
+
+
+
+(defmacro rc-ext:with-backtrace (&rest form)
+  (let ((tag 'RC-EXT::ERROR!!))
+    `(let* ((debugger (lambda (&rest args)
+                        (rc-ext:debug:backtrace ',tag
+                                                args
+                                                1)))
+            (real-result   nil)
+            (result (catch ',tag
+                      (setq real-result
+                            (progn ,@form))
+                      :done)))
+       (if (eq result :done)
+           real-result
+         (error result)))))
+
+
+
+
 
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;;
-;;; debugging utilities
-;;;
 
 (defun rc-ext:file-with-face (file)
   (if file
@@ -232,7 +281,6 @@
     (defun rc-ext:error (form &rest vals)
       (apply 'rc-ext:error-message form vals)
       (error (apply 'format form vals)))
-
     ))
 
 ;;(rc-ext:error-message "xxx")
@@ -242,71 +290,90 @@
 ;;;
 ;;; module system
 ;;;
-(lexical-let
-    ((mods-alist    ())
-     (waiting-plist ())
-     (provided      ()))
+(defvar rc-ext:$mods-alist    ())
+(defvar rc-ext:$provided      ())
+(defvar rc-ext:$waiting-plist ())
 
-  (defun rc-ext:provide (feature body)
-    (unless (member feature provided)
-      (let ((R (funcall body)))
-        (setq provided (cons feature provided))
-        (dolist (mod (plist-get waiting-plist feature))
-          (let ((n-depends (1- (caddr mod))))
-            (setcdr (cdr mod) (list n-depends))
-            (when (zerop n-depends)
-              (rc-ext:provide (car mod) (cadr mod)))))
-        R)))
+(defun rc-ext:provide (feature body)
+  (if (member feature rc-ext:$provided)
+      t
+    (let ((R (funcall body)))
 
-  (defun rc-ext:defconfig (name depends body file)
-    (setq mods-alist (cons (list name depends body file)
-                           mods-alist)))
+      (rc-ext:log "provide ... execute body %s -> %S" feature R)
 
-  (defun rc-ext:run (name)
-    (unless (member name provided)
-      (let ((config  (assq name mods-alist)))
-        (if config
-            (let ((depends (cadr config))
-                  (body    (caddr config))
-                  (deplen  0))
+      (setq rc-ext:$provided (cons feature rc-ext:$provided))
 
-              (dolist (dep depends)
-                (unless (member dep provided)
-                  (setq deplen (1+ deplen))))
+      (dolist (mod (plist-get rc-ext:$waiting-plist feature))
 
-              (if (zerop deplen)
-                  (rc-ext:provide name body)
+        (let ((n-depends (1- (caddr mod))))
+          (setcdr (cdr mod) (list n-depends))
 
-                (let ((modinfo (list name body deplen)))
+          (rc-ext:log "    -> %S" mod)
+
+          (when (zerop n-depends)
+            (rc-ext:provide (car mod) (cadr mod)))))
+
+
+      R)))
+
+(defun rc-ext:defconfig (name depends body file)
+  (setq rc-ext:$mods-alist (cons (list name depends body file)
+                                 rc-ext:$mods-alist)))
+
+(defun rc-ext:run (name)
+  (unless (member name rc-ext:$provided)
+    (let ((config  (assq name rc-ext:$mods-alist)))
+      (if config
+          (let ((depends (cadr config))
+                (body    (caddr config))
+                (deplen  0))
+            
+            (dolist (dep depends)
+              (unless (member dep rc-ext:$provided)
+                (setq deplen (1+ deplen))))
+            
+            (if (zerop deplen)
+                (rc-ext:provide name body)
+              
+              (let ((modinfo (list name body deplen)))
+                (dolist (dep depends)
+                  (let ((slot (plist-get rc-ext:$waiting-plist dep)))
+                    (if slot
+                        (plist-set rc-ext:$waiting-plist
+                                   dep
+                                   (cons modinfo slot))
+                      (setq rc-ext:$waiting-plist
+                            (cons dep (cons (list modinfo)
+                                            rc-ext:$waiting-plist)))))))))
+        (rc-ext:error "unknown config %s" name)))))
+
+(lexical-let ((last-error nil))
+  (defun rc-ext:lazy-run (name)
+    (rc-ext:log "lazy-run: %s" name)
+    (if (member name rc-ext:$provided) t
+      (let ((config  (assq name rc-ext:$mods-alist)))
+        (when config
+          (let ((depends (cadr config))
+                (body    (caddr config))
+                (file    (cadddr config)))
+
+            (condition-case err
+
+                (progn
                   (dolist (dep depends)
-                    (let ((slot (plist-get waiting-plist dep)))
-                      (if slot
-                          (plist-set waiting-plist
-                               dep
-                               (cons modinfo slot))
-                        (setq waiting-plist
-                              (cons dep (cons (list modinfo)
-                                              waiting-plist)))))))))
-          (rc-ext:error "unknown config %s" name)))))
+                    (rc-ext:log "load depends: %s" dep)
+                    (unless (rc-ext:lazy-run dep)
+                      (error (or last-error
+                                 "???"))))
+                  (rc-ext:log "lazy provide %s" name)
+                  (rc-ext:provide name body))
 
-  (lexical-let ((last-error nil))
-    (defun rc-ext:lazy-run (name)
-      (if (member name provided) t
-        (let ((config  (assq name mods-alist)))
-          (when config
-            (let ((depends (cadr config))
-                  (body    (caddr config))
-                  (file    (cadddr config)))
-              (condition-case err
-                  (progn
-                    (dolist (dep depends)
-                      (unless (rc-ext:lazy-run dep) (error last-error)))
-                    (rc-ext:provide name body))
-                (error (setq last-error err)
-                       (rc-ext:error-message "lazy-run: %s %s"
-                                             file
-                                             err)
-                       nil)))))))))
+              (error (setq last-error err)
+                     (rc-ext:error-message "error lazy-run: %s %s %s"
+                                           name
+                                           file
+                                           err)
+                     nil))))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;
@@ -314,6 +381,7 @@
 ;;;
 
 (defun rc-ext:execute-body (name path load get init file  retry)
+  (rc-ext:log "execute-body %s" name)
   (let ((rc-site-lisp
          (expand-file-name
           (if path
@@ -326,7 +394,7 @@
     (unless (file-exists-p rc-site-lisp)
       (make-directory rc-site-lisp))
     (when (condition-case e
-              (progn
+              (rc-ext:with-backtrace
                 (rc-ext:log "load %s: %s" name (rc-ext:file-with-face file))
                 (apply load ())
                 t)
@@ -342,9 +410,10 @@
                    (rc-ext:execute-body name path load get init file nil))
                nil)))
       (condition-case e
-          (progn
+          (rc-ext:with-backtrace
             (rc-ext:log "init %s: %s" name (rc-ext:file-with-face file))
             (apply init ())
+            (rc-ext:log "init ... done %s: %s" name (rc-ext:file-with-face file))
             t)
         (error
          (rc-ext:error-message
@@ -379,7 +448,8 @@
            (path     (plist-get args :path    ))
 
            (load     (let ((load (if (member :load args)
-                                     (plist-get args :load) name)))
+                                     (plist-get args :load)
+                                   name)))
                        (if (and load (symbolp load))
                            `(lambda () (require ',load))
                          (or load (lambda ())))))
@@ -438,7 +508,9 @@
                                 ',cfg-name
                                 (rc-ext:file-with-face ,file))))))))
 
-            (rc-ext:run cfg-name))))))
+            (rc-ext:run cfg-name)))))
+
+  );; end of lexical-let
 
   
   
