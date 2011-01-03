@@ -133,15 +133,6 @@
                               tail)))))
       str)
 
-     (response-filename
-      (res)
-      (let ((url (replace-regexp-in-string
-                  "\\?.*$" ""
-                  (cdr (assoc 'url res)))))
-        (when (and url
-                   (string-match "\\([^/]+\\)$" url))
-          (rc-uri-decode (match-string 1 url)))))
-
      (with-url
       (url callback &optional accept-statuses)
       (let* ((res  (http-get url))
@@ -161,6 +152,14 @@
               (apply callback (list (cdr (assoc 'content res)) res)))
           (throw 'illegal-http-code res)))))
 
+  (defun rc-get:response-filename (res)
+    (let ((url (replace-regexp-in-string
+                "\\?.*$" ""
+                (cdr (assoc 'url res)))))
+      (when (and url
+                 (string-match "\\([^/]+\\)$" url))
+        (uri-decode (match-string 1 url)))))
+
 
   (defun rc-get (url &rest opts)
     (let* ((opts        (if (= 1 (length opts))
@@ -176,13 +175,13 @@
           (let ((filename
                  (expand-file-name (concat rc-site-lisp "/"
                                            (or ,opt-filename
-                                               (response-filename res))))))
+                                               (rc-get:response-filename res))))))
             (set-buffer buf)
             (setq buffer-file-name filename)
             (replace-string "" "")
             (save-buffer)
             (kill-buffer buf)
-            ,@(unless not-compile '(byte-compile-file filename))
+            ,(unless not-compile '(byte-compile-file filename))
             filename)))))))
 
 
